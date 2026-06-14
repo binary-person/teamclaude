@@ -49,6 +49,10 @@ export class AccountManager {
    * Returns null if all accounts are exhausted.
    */
   getActiveAccount() {
+    // Clear expired quotas across all accounts and switch proactively if a
+    // session reset made a sooner-expiring account the better choice. This runs
+    // on every request so the behaviour holds without the TUI render loop.
+    this.refreshExpiredQuotas();
     const current = this.accounts[this.currentIndex];
     // We just learned a probed account's weekly quota — re-evaluate which
     // account is best now that its limit is known.
@@ -85,12 +89,13 @@ export class AccountManager {
    * call frequently (e.g. from the TUI render loop) — once a counter is cleared
    * it stays null until the next upstream response repopulates it, so the
    * "reset" log fires at most once per window.
-   * @returns {boolean} true if anything was cleared.
+   * @returns {{changed: boolean, session: boolean}} what was cleared.
    */
   _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
     let changed = false;
+    let session = false;
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
@@ -98,6 +103,7 @@ export class AccountManager {
       q.unified5h = null;
       q.unified5hReset = null;
       changed = true;
+      session = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
@@ -117,20 +123,59 @@ export class AccountManager {
       changed = true;
     }
 
+    return { changed, session };
+  }
+
+  /**
+   * Clear expired quotas across all accounts. Called from the display loop and
+   * the request path so a window expiry (e.g. the 5-hour session quota) resets
+   * the view instantly rather than waiting for the next request.
+   *
+   * When an account's session quota resets, it may have become the better
+   * choice — switch to it if its weekly limit expires sooner than the current
+   * account's (and it still has weekly quota), so we spend the quota closest to
+   * refreshing first.
+   */
+  refreshExpiredQuotas() {
+    let changed = false;
+    const sessionReset = [];
+    for (const account of this.accounts) {
+      const r = this._clearExpiredQuotas(account);
+      if (r.changed) changed = true;
+      if (r.session) sessionReset.push(account);
+    }
+    if (sessionReset.length) this._switchOnSessionReset(sessionReset);
     return changed;
   }
 
   /**
-   * Clear expired quotas across all accounts. Called by the display so a window
-   * expiry (e.g. the 5-hour session quota) resets the view instantly rather
-   * than waiting for the next request.
+   * Given accounts whose session quota just reset, switch to the one whose
+   * weekly limit expires soonest — but only if that is sooner than the current
+   * account's weekly limit and the account still has weekly quota to spend.
    */
-  refreshExpiredQuotas() {
-    let changed = false;
-    for (const account of this.accounts) {
-      if (this._clearExpiredQuotas(account)) changed = true;
+  _switchOnSessionReset(candidates) {
+    const current = this.accounts[this.currentIndex];
+    // Need a known weekly reset on the current account to compare against;
+    // if it is unknown we are still probing it, so leave it alone.
+    if (!current || current.quota.unified7dReset == null) return;
+
+    let best = null;
+    let bestWeekly = current.quota.unified7dReset;
+    for (const acc of candidates) {
+      if (acc.index === this.currentIndex) continue;
+      if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      const weekly = acc.quota.unified7dReset;
+      if (weekly == null) continue; // need a known weekly to compare
+      if (weekly < bestWeekly) {
+        bestWeekly = weekly;
+        best = acc;
+      }
     }
-    return changed;
+
+    if (best) {
+      this.currentIndex = best.index;
+      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+    }
   }
 
   _isNearQuota(account) {
